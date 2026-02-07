@@ -54,7 +54,7 @@ def main():
                        help="Whisper model: tiny.en, base.en, small.en (default: tiny.en)")
     parser.add_argument("--sensitivity", type=float, default=0.2,
                        help="Wake word sensitivity 0.0-1.0 (default: 0.2)")
-    parser.add_argument("--pause", type=float, default=2.0,
+    parser.add_argument("--pause", type=float, default=1.6,
                        help="Seconds of silence before finalizing speech (default: 1.6)")
     args = parser.parse_args()
 
