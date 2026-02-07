@@ -23,17 +23,25 @@ def suppress_alsa_errors():
     except:
         pass
 
-def send_to_claude(text: str) -> str:
+def send_to_claude(text: str, continue_session: bool = False) -> str:
     """Send text to claude CLI and return response."""
-    result = subprocess.run(
-        ["claude", "-p", text],
-        capture_output=True,
-        text=True
-    )
+    cmd = ["claude", "-p", text]
+    if continue_session:
+        cmd.append("--continue")
+    result = subprocess.run(cmd, capture_output=True, text=True)
     return result.stdout
+
+import time
+
+_last_wakeword_time = 0
 
 def on_wakeword():
     """Called when wake word is detected."""
+    global _last_wakeword_time
+    now = time.time()
+    if now - _last_wakeword_time < 3:
+        return
+    _last_wakeword_time = now
     print("\n✨ Wake word detected! Listening for command...")
 
 def main():
@@ -44,8 +52,10 @@ def main():
                        help="Wake word to use (default: 'hey jarvis'). Options: 'alexa', 'hey mycroft', 'hey jarvis'")
     parser.add_argument("--model", type=str, default="tiny.en",
                        help="Whisper model: tiny.en, base.en, small.en (default: tiny.en)")
-    parser.add_argument("--sensitivity", type=float, default=0.3,
-                       help="Wake word sensitivity 0.0-1.0 (default: 0.3)")
+    parser.add_argument("--sensitivity", type=float, default=0.2,
+                       help="Wake word sensitivity 0.0-1.0 (default: 0.2)")
+    parser.add_argument("--pause", type=float, default=2.0,
+                       help="Seconds of silence before finalizing speech (default: 1.6)")
     args = parser.parse_args()
 
     suppress_alsa_errors()
@@ -70,6 +80,7 @@ def main():
         print("Speak naturally, pause when done.")
 
     print(f"Model: {args.model}")
+    print(f"Pause: {args.pause}s (silence before transcribing)")
     print("Press Ctrl+C to exit.")
     print("=" * 50)
     print()
@@ -79,7 +90,7 @@ def main():
         "model": args.model,
         "language": "en",
         "silero_sensitivity": 0.4,
-        "post_speech_silence_duration": 0.8,
+        "post_speech_silence_duration": args.pause,
     }
 
     if use_wakeword:
@@ -91,6 +102,8 @@ def main():
         })
 
     recorder = AudioToTextRecorder(**recorder_config)
+
+    first_message = True
 
     if use_wakeword:
         print(f"🔇 Waiting for \"{args.wake_word}\"...")
@@ -109,7 +122,8 @@ def main():
             print(f"\n📝 You said: {text}")
             print("\n🤖 Claude is thinking...")
 
-            response = send_to_claude(text)
+            response = send_to_claude(text, continue_session=not first_message)
+            first_message = False
 
             print("\n" + "-" * 50)
             print(response)
