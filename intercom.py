@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
 Intercom - Voice-activated Claude assistant
-Phase 2: Wake word + real-time voice to Claude CLI
+Phase 3: Wake word + STT + Claude CLI + TTS
 """
 
 import subprocess
 import sys
 import argparse
 import os
+import tempfile
+import asyncio
 
 # Suppress ALSA/JACK warnings
 os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = '1'
@@ -30,6 +32,25 @@ def send_to_claude(text: str, continue_session: bool = False) -> str:
         cmd.append("--continue")
     result = subprocess.run(cmd, capture_output=True, text=True)
     return result.stdout
+
+def speak(text: str, voice: str):
+    """Speak text using edge-tts."""
+    import edge_tts
+
+    async def _speak():
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+            tmp_path = f.name
+        try:
+            communicate = edge_tts.Communicate(text, voice)
+            await communicate.save(tmp_path)
+            subprocess.run(
+                ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", tmp_path],
+                check=True,
+            )
+        finally:
+            os.unlink(tmp_path)
+
+    asyncio.run(_speak())
 
 import time
 
@@ -56,6 +77,10 @@ def main():
                        help="Wake word sensitivity 0.0-1.0 (default: 0.2)")
     parser.add_argument("--pause", type=float, default=1.6,
                        help="Seconds of silence before finalizing speech (default: 1.6)")
+    parser.add_argument("--no-tts", action="store_true",
+                       help="Disable text-to-speech (text-only output)")
+    parser.add_argument("--voice", type=str, default="en-US-GuyNeural",
+                       help="Edge TTS voice (default: en-US-GuyNeural). Run 'edge-tts --list-voices' to see options")
     args = parser.parse_args()
 
     suppress_alsa_errors()
@@ -65,6 +90,15 @@ def main():
     except ImportError:
         print("Missing dependencies. Run: pip install -r requirements.txt")
         sys.exit(1)
+
+    # Check TTS availability
+    tts_enabled = False
+    if not args.no_tts:
+        try:
+            import edge_tts
+            tts_enabled = True
+        except ImportError:
+            print("TTS: edge-tts not installed, falling back to text-only")
 
     print("=" * 50)
     print("INTERCOM - Voice-activated Claude")
@@ -81,6 +115,7 @@ def main():
 
     print(f"Model: {args.model}")
     print(f"Pause: {args.pause}s (silence before transcribing)")
+    print(f"TTS: {args.voice if tts_enabled else 'disabled'}")
     print("Press Ctrl+C to exit.")
     print("=" * 50)
     print()
@@ -128,6 +163,9 @@ def main():
             print("\n" + "-" * 50)
             print(response)
             print("-" * 50)
+
+            if tts_enabled and response.strip():
+                speak(response.strip(), args.voice)
 
             if use_wakeword:
                 print(f"\n🔇 Waiting for \"{args.wake_word}\"...")

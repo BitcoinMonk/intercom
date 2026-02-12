@@ -1,3 +1,4 @@
 RealtimeSTT
+edge-tts
 pyaudio
 requests
