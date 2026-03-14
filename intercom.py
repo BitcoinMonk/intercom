@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Intercom - Voice-activated Claude assistant
-Phase 3: Wake word + STT + Claude CLI + TTS
+Direct API with streaming, conversation memory, and barge-in interrupt.
 """
 
 import subprocess
@@ -10,14 +10,17 @@ import argparse
 import os
 import tempfile
 import asyncio
+import signal
+import threading
+import time
+
+from dotenv import load_dotenv
+load_dotenv()
 
 # Suppress ALSA/JACK warnings
 os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = '1'
-stderr_backup = None
 
 def suppress_alsa_errors():
-    """Suppress ALSA error messages."""
-    global stderr_backup
     import ctypes
     try:
         asound = ctypes.cdll.LoadLibrary('libasound.so.2')
@@ -25,62 +28,121 @@ def suppress_alsa_errors():
     except:
         pass
 
-def send_to_claude(text: str, continue_session: bool = False) -> str:
-    """Send text to claude CLI and return response."""
-    cmd = ["claude", "-p", text]
-    if continue_session:
-        cmd.append("--continue")
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    return result.stdout
+
+# --- TTS with interruptible playback ---
+
+_tts_process = None
+_tts_lock = threading.Lock()
+
+def stop_speaking():
+    """Kill any in-progress TTS playback."""
+    global _tts_process
+    with _tts_lock:
+        if _tts_process and _tts_process.poll() is None:
+            _tts_process.kill()
+            _tts_process.wait()
+            _tts_process = None
 
 def speak(text: str, voice: str):
-    """Speak text using edge-tts."""
+    """Speak text using edge-tts. Can be interrupted by stop_speaking()."""
+    global _tts_process
     import edge_tts
 
     async def _speak():
+        global _tts_process
         with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
             tmp_path = f.name
         try:
             communicate = edge_tts.Communicate(text, voice)
             await communicate.save(tmp_path)
-            subprocess.run(
-                ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", tmp_path],
-                check=True,
-            )
+            with _tts_lock:
+                _tts_process = subprocess.Popen(
+                    ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", tmp_path],
+                )
+            _tts_process.wait()
         finally:
-            os.unlink(tmp_path)
+            with _tts_lock:
+                _tts_process = None
+            try:
+                os.unlink(tmp_path)
+            except:
+                pass
 
     asyncio.run(_speak())
 
-import time
+
+# --- Claude API ---
+
+def create_client():
+    from anthropic import Anthropic
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        print("Error: ANTHROPIC_API_KEY not set. Add it to .env")
+        sys.exit(1)
+    return Anthropic(api_key=api_key)
+
+def send_to_claude(client, messages: list, text: str, system_prompt: str) -> str:
+    """Send text to Claude API with streaming. Returns full response."""
+    messages.append({"role": "user", "content": text})
+
+    full_response = ""
+    with client.messages.stream(
+        model="claude-sonnet-4-20250514",
+        max_tokens=300,
+        system=system_prompt,
+        messages=messages,
+    ) as stream:
+        for chunk in stream.text_stream:
+            print(chunk, end="", flush=True)
+            full_response += chunk
+
+    messages.append({"role": "assistant", "content": full_response})
+
+    # Keep conversation history manageable (last 20 exchanges)
+    if len(messages) > 40:
+        messages[:] = messages[-40:]
+
+    return full_response
+
+
+# --- Wake word ---
 
 _last_wakeword_time = 0
 
 def on_wakeword():
-    """Called when wake word is detected."""
     global _last_wakeword_time
     now = time.time()
     if now - _last_wakeword_time < 3:
         return
     _last_wakeword_time = now
-    print("\n✨ Wake word detected! Listening for command...")
+    stop_speaking()  # Interrupt TTS if speaking
+    print("\n✨ Wake word detected! Listening...")
+
+
+# --- Main ---
+
+SYSTEM_PROMPT = (
+    "You are a voice assistant. Keep responses short and conversational — "
+    "1-3 sentences unless asked for detail. Be direct and helpful. "
+    "Don't use markdown, bullet points, or formatting — you're being read aloud."
+)
 
 def main():
     parser = argparse.ArgumentParser(description="Intercom - Voice-activated Claude")
     parser.add_argument("--no-wake", action="store_true",
                        help="Disable wake word (always listening)")
     parser.add_argument("--wake-word", type=str, default="hey jarvis",
-                       help="Wake word to use (default: 'hey jarvis'). Options: 'alexa', 'hey mycroft', 'hey jarvis'")
+                       help="Wake word (default: 'hey jarvis')")
     parser.add_argument("--model", type=str, default="tiny.en",
-                       help="Whisper model: tiny.en, base.en, small.en (default: tiny.en)")
+                       help="Whisper model: tiny.en, base.en, small.en")
     parser.add_argument("--sensitivity", type=float, default=0.2,
-                       help="Wake word sensitivity 0.0-1.0 (default: 0.2)")
+                       help="Wake word sensitivity 0.0-1.0")
     parser.add_argument("--pause", type=float, default=1.6,
-                       help="Seconds of silence before finalizing speech (default: 1.6)")
+                       help="Seconds of silence before finalizing speech")
     parser.add_argument("--no-tts", action="store_true",
-                       help="Disable text-to-speech (text-only output)")
+                       help="Disable text-to-speech")
     parser.add_argument("--voice", type=str, default="en-US-GuyNeural",
-                       help="Edge TTS voice (default: en-US-GuyNeural). Run 'edge-tts --list-voices' to see options")
+                       help="Edge TTS voice")
     args = parser.parse_args()
 
     suppress_alsa_errors()
@@ -88,17 +150,20 @@ def main():
     try:
         from RealtimeSTT import AudioToTextRecorder
     except ImportError:
-        print("Missing dependencies. Run: pip install -r requirements.txt")
+        print("Missing: pip install -r requirements.txt")
         sys.exit(1)
 
-    # Check TTS availability
     tts_enabled = False
     if not args.no_tts:
         try:
             import edge_tts
             tts_enabled = True
         except ImportError:
-            print("TTS: edge-tts not installed, falling back to text-only")
+            print("TTS: edge-tts not installed, text-only mode")
+
+    # Init Claude API client
+    client = create_client()
+    messages = []
 
     print("=" * 50)
     print("INTERCOM - Voice-activated Claude")
@@ -107,16 +172,14 @@ def main():
     use_wakeword = not args.no_wake
 
     if use_wakeword:
-        print(f"Wake word: \"{args.wake_word}\"")
-        print(f"Say \"{args.wake_word}\" then speak your command.")
+        print(f'Wake word: "{args.wake_word}"')
     else:
         print("Wake word: DISABLED (always listening)")
-        print("Speak naturally, pause when done.")
 
-    print(f"Model: {args.model}")
-    print(f"Pause: {args.pause}s (silence before transcribing)")
+    print(f"Model: {args.model} | Pause: {args.pause}s")
     print(f"TTS: {args.voice if tts_enabled else 'disabled'}")
-    print("Press Ctrl+C to exit.")
+    print(f"API: Direct (streaming) | Interrupt: speak to cut off")
+    print("Ctrl+C to exit.")
     print("=" * 50)
     print()
 
@@ -138,10 +201,8 @@ def main():
 
     recorder = AudioToTextRecorder(**recorder_config)
 
-    first_message = True
-
     if use_wakeword:
-        print(f"🔇 Waiting for \"{args.wake_word}\"...")
+        print(f'🔇 Waiting for "{args.wake_word}"...')
     else:
         print("🎤 Listening...")
 
@@ -151,28 +212,28 @@ def main():
 
             if not text or not text.strip():
                 if use_wakeword:
-                    print(f"\n🔇 Waiting for \"{args.wake_word}\"...")
+                    print(f'\n🔇 Waiting for "{args.wake_word}"...')
                 continue
 
-            print(f"\n📝 You said: {text}")
-            print("\n🤖 Claude is thinking...")
+            # Interrupt any current TTS
+            stop_speaking()
 
-            response = send_to_claude(text, continue_session=not first_message)
-            first_message = False
+            print(f"\n📝 You: {text}")
+            print("🤖 ", end="", flush=True)
 
-            print("\n" + "-" * 50)
-            print(response)
-            print("-" * 50)
+            response = send_to_claude(client, messages, text, SYSTEM_PROMPT)
+            print()
 
             if tts_enabled and response.strip():
                 speak(response.strip(), args.voice)
 
             if use_wakeword:
-                print(f"\n🔇 Waiting for \"{args.wake_word}\"...")
+                print(f'\n🔇 Waiting for "{args.wake_word}"...')
             else:
                 print("\n🎤 Listening...")
 
         except KeyboardInterrupt:
+            stop_speaking()
             print("\n\nGoodbye!")
             break
 
